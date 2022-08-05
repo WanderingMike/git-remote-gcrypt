@@ -1,0 +1,25 @@
+#!/usr/bin/env bats
+
+setup() {
+	# use $BATS_TEST_FILENAME instead of ${BASH_SOURCE[0]} or $0,
+	DIR="$( cd "$( dirname "$BATS_TEST_FILENAME" )" >/dev/null 2>&1 && pwd )"
+	# make executables in src/ visible to PATH
+	PATH="$DIR/../src:$PATH"
+}
+
+@test "Testing gcrypt for a single user" {
+  result="$($DIR/single_person.sh)"
+}
+
+@test "Testing gcrypt for two users collaborating on same branch through the remote" {
+  result="$($DIR/team_collab.sh)"
+}
+
+@test "Testing gcrypt for two users working on separate branches" {
+  result="$($DIR/team_split.sh)"
+}
+
+@test "Testing repack option given the new features" {
+  result="$($DIR/repack.sh)"
+}
+

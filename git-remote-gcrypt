@@ -27,6 +27,7 @@ set -C # noclobber
 
 export GITCEPTION="${GITCEPTION:-}+" # Reuse $Gref except when stacked
 Gref="refs/gcrypt/gitception$GITCEPTION"
+Gref_old="refs/gcrypt/gitception-old$GITCEPTION"
 Gref_rbranch="refs/heads/master"
 Packkey_bytes=63  # nbr random bytes for packfile keys, any >= 256 bit is ok
 Hashtype=SHA256   # SHA512 SHA384 SHA256 SHA224 supported.
@@ -182,6 +183,40 @@ Initial commit
 EOF
 }
 
+anon_commit_history()
+{
+	# read r_signers from gcrypt.participants
+	read_config @r_sigmatch @r_signers
+
+	# improve readability
+	signers=$(
+		for s in ${r_signers}; do
+			signer_name=$(gpg --with-colons --list-keys "${s}" | awk -F: '$1=="uid" { print $10 }')
+			ekey=$(gpg --list-keys --with-colons ${s} | grep -E ":(s|c|a)*e(s|c|a)*:" | grep -o -E "\w{16}")
+			echo -n "<${ekey}> "
+		done
+	)
+	# This part (History) will be the Commit Message
+		git commit-tree "$@" <<EOF
+== History ==
+
+pointer:$(git log --format="%h " "$Gref_old")${signers}
+$(git log --format="%ai %an commit:%h " "$Gref")$(git log --format="%b" "$Gref")
+EOF
+}
+
+anon_commit_nc() # anon_commit() but without changing the commit message
+{
+	# read r_signers from gcrypt.participants
+	read_config @r_sigmatch @r_signers
+
+	# This part (History) will be the Commit Message
+	git diff-tree --no-commit-id --name-only -r "${Gref}" &&
+		git commit-tree "$@" <<EOF
+$(git log --format="%B" "$Gref")
+EOF
+}
+
 # Get 'tree' from $1, change file $2 to obj id $3
 update_tree()
 {
@@ -197,12 +232,29 @@ update_tree()
 # depends on previous GET to set $Gref and depends on PUT_FINAL later
 gitception_put()
 {
-	local obj_id= tree_id= commit_id=
+	local obj_id= tree_id= commit_id= which_anon= save_gref=
+
+	if [ "$Conf_history" = false -o -z $Conf_history ]
+	then
+		which_anon=anon_commit
+		save_gref=false
+	elif [ $3 -eq 2 ]
+	then
+		which_anon=anon_commit_nc
+		save_gref=true
+	else
+		which_anon=anon_commit_history
+		save_gref=true
+	fi
+
 	obj_id=$(git hash-object -w --stdin) &&
 		tree_id=$(update_tree "$Gref" "$2" "$obj_id") &&
-		commit_id=$(anon_commit "$tree_id") &&
-		git update-ref "$Gref" "$commit_id"
+		commit_id=$($which_anon "$tree_id") &&
+		git update-ref "$Gref" "$commit_id" &&
+		git update-ref "$Gref_old" "$Gref"
+
 }
+
 
 # Remove giturl $1, file $2
 # depends on previous GET like put
@@ -211,8 +263,9 @@ gitception_remove()
 	local tree_id= commit_id= tab_="	"
 	# $2 is a filename from the repo format
 	tree_id=$(git ls-tree "$Gref" | xgrep -v -E '\b'"$2"'$' | git mktree) &&
-		commit_id=$(anon_commit "$tree_id") &&
-		git update-ref "$Gref" "$commit_id"
+		commit_id=$(anon_commit_nc "$tree_id") &&
+		git update-ref "$Gref" "$commit_id" &&
+		git update-ref "$Gref_old" "$Gref"
 }
 
 gitception_new_repo()
@@ -223,7 +276,9 @@ gitception_new_repo()
 	gitception_get "$1" "x" 2>/dev/null >&2 || :
 	git rev-parse -q --verify "$Gref" >/dev/null && return 0 ||
 		commit_id=$(anon_commit "$empty_tree") &&
-		git update-ref "$Gref" "$commit_id"
+		git update-ref "$Gref" "$commit_id" &&
+		git update-ref "$Gref_old" "$Gref"
+
 }
 ## end gitception
 
@@ -263,7 +318,7 @@ PUT()
 	then
 		cat >| "$1/$2" < "$3"
 	else
-		gitception_put "${1#gitception://}" "$2" < "$3"
+		gitception_put "${1#gitception://}" "$2" "$4" < "$3"
 	fi
 }
 
@@ -332,7 +387,7 @@ CLEAN_FINAL()
 	then
 		:
 	else
-		git update-ref -d "$Gref" || :
+		:
 	fi
 }
 
@@ -440,6 +495,8 @@ read_config()
 		git config --get "gcrypt.rsync-put-flags" '.+' || :)
 	Conf_force_required=$(git config --get --bool "remote.$NAME.gcrypt-require-explicit-force-push" '.+' ||
 		git config --get --bool gcrypt.require-explicit-force-push '.+' || :)
+	Conf_history=$(git config --get "remote.$NAME.gcrypt-history" '.+' ||
+		git config --get --bool gcrypt.history '.+' || :)
 
 	# Figure out which keys we should encrypt to or accept signatures from
 	if isnull "$conf_part" || iseq "$conf_part" simple
@@ -480,6 +537,11 @@ read_config()
 		# Check 'E'ncrypt capability
 		cap_=$(xfeed "$r_keyinfo" cut -f 12 -d :)
 		if ! iseq "${cap_#*E}" "$cap_"; then
+			# modified to always true so we can check the encryption server side in a git hook
+			if [ "$Conf_history" = true ]
+			then
+				Conf_pubish_participants=true
+			fi
 			if [ "$Conf_pubish_participants" = true ]; then
 				Recipients="$Recipients -r $keyid_"
 			else
@@ -727,6 +789,8 @@ do_fetch()
 
 	xfeed "$pneed_" get_pack_files
 
+	git update-ref "$Gref_old" "$Gref"
+
 	echo_git # end with blank line
 }
 
@@ -739,7 +803,7 @@ do_push()
 	# The manifest is encrypted.
 	local r_revlist= pack_id= key_= obj_= src_= dst_= \
 		r_pack_delete= tmp_encrypted= tmp_objlist= tmp_manifest= \
-		force_passed=
+		force_passed= pack_exists=
 
 	ensure_connected
 
@@ -825,13 +889,17 @@ $Extnlist
 EOF
 
 	# Upload pack
+	pack_exists=0
 	if [ -s "$tmp_objlist" ]
 	then
-		PUT "$URL" "$pack_id" "$tmp_encrypted"
+		PUT "$URL" "$pack_id" "$tmp_encrypted" "$pack_exists"
+		pack_exists=2
+	else
+		pack_exists=1
 	fi
 
 	# Upload manifest
-	PUT "$URL" "$Manifestfile" "$tmp_manifest"
+	PUT "$URL" "$Manifestfile" "$tmp_manifest" "$pack_exists"
 
 	rm -f "$tmp_encrypted"
 	rm -f "$tmp_objlist"
